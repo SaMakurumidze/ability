@@ -1,0 +1,19 @@
+{
+  "name": "ability-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ability System — API (Express+Neon), Mobile (Expo), Web (Next.js)",
+  "workspaces": [
+    "ability-api",
+    "ability-mobile",
+    "ability-web"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace=ability-api",
+    "dev:mobile": "npm run start --workspace=ability-mobile",
+    "dev:web": "npm run dev --workspace=ability-web",
+    "build:api": "npm run build --workspace=ability-api",
+    "build:web": "npm run build --workspace=ability-web",
+    "typecheck:mobile": "npm run typecheck --workspace=ability-mobile"
+  }
+}
