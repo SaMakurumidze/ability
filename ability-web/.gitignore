@@ -2,3 +2,8 @@
 out/
 node_modules/
 .env*.local
+public/components/
+public/hooks/
+public/lib/
+public/styles/
+public/.gitignore

@@ -1,21 +1,62 @@
+'use client';
+
+import { useRef, useState } from 'react';
+import { HeroSection } from '@/components/landing/hero-section';
+import { LoginCard } from '@/components/login/login-card';
+
 export default function HomePage() {
+  const [showLogin, setShowLogin] = useState(false);
+  const loginRef = useRef<HTMLDivElement>(null);
+
+  const handleLoginClick = () => {
+    setShowLogin(true);
+    setTimeout(() => {
+      loginRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+  };
+
   return (
-    <main className="mx-auto flex min-h-screen max-w-3xl flex-col justify-center px-6 py-16">
-      <p className="text-sm font-semibold uppercase tracking-wide text-blue-600">
-        Ability Web
-      </p>
-      <h1 className="mt-2 text-3xl font-bold text-slate-900 sm:text-4xl">
-        Business &amp; Government wallets
-      </h1>
-      <p className="mt-4 text-lg text-slate-600">
-        Next.js portal for organizational accounts. Connect this app to{' '}
-        <code className="rounded bg-slate-200 px-1.5 py-0.5 text-sm">ability-api</code>{' '}
-        (Express + Neon + JWT auth) when you are ready to add sign-in and treasury flows.
-      </p>
-      <ul className="mt-8 list-inside list-disc space-y-2 text-slate-700">
-        <li>Runs on port <strong>3001</strong> by default (mobile API often uses 3000).</li>
-        <li>Investor app lives in <code className="text-sm">ability-mobile</code> (Expo).</li>
-      </ul>
+    <main className="min-h-screen bg-background">
+      <HeroSection onLoginClick={handleLoginClick} />
+
+      <section
+        ref={loginRef}
+        className={`px-4 transition-all duration-500 ${
+          showLogin ? 'py-16 opacity-100' : 'h-0 overflow-hidden py-0 opacity-0'
+        }`}
+      >
+        <div className="container mx-auto flex justify-center">
+          <LoginCard />
+        </div>
+      </section>
+
+      <section className="bg-secondary/30 px-4 py-20">
+        <div className="container mx-auto">
+          <div className="grid gap-8 md:grid-cols-3">
+            <FeatureCard
+              title="For Issuers"
+              description="Raise capital and monitor investment activity with one wallet view."
+            />
+            <FeatureCard
+              title="For Businesses"
+              description="Track incoming and outgoing settlements from your organization dashboard."
+            />
+            <FeatureCard
+              title="API-Connected"
+              description="Uses Ability API auth, wallet balances, and transaction endpoints."
+            />
+          </div>
+        </div>
+      </section>
     </main>
+  );
+}
+
+function FeatureCard({ title, description }: { title: string; description: string }) {
+  return (
+    <div className="rounded-xl border border-border/50 bg-card p-6 shadow-sm transition-shadow hover:shadow-md">
+      <h3 className="mb-2 text-lg font-semibold text-foreground">{title}</h3>
+      <p className="leading-relaxed text-muted-foreground">{description}</p>
+    </div>
   );
 }
