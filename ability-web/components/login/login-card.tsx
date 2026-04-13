@@ -27,7 +27,19 @@ export function LoginCard() {
     try {
       const response = await login(phone, password);
       setStoredToken(response.token);
-      router.push(userType === 'issuer' ? '/issuer' : '/business');
+      const walletClass = response.user.wallet_class;
+      const isIssuerClass = walletClass === 'issuer_company' || walletClass === 'issuer_government';
+      const isBusinessClass =
+        walletClass === 'business_vendor' || walletClass === 'business_contractor';
+
+      if (userType === 'issuer' && !isIssuerClass) {
+        throw new Error('This account is not an Issuer Wallet holder.');
+      }
+      if (userType === 'business' && !isBusinessClass) {
+        throw new Error('This account is not a Business Wallet holder.');
+      }
+
+      router.push(isIssuerClass ? '/issuer' : '/business');
     } catch (err: any) {
       setError(err?.message || 'Login failed.');
     } finally {

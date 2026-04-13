@@ -62,6 +62,11 @@ export default function BusinessDashboard() {
     (async () => {
       try {
         const [me, tx] = await Promise.all([getMe(token), getTransactions(token)]);
+        if (me.wallet_class !== 'business_vendor' && me.wallet_class !== 'business_contractor') {
+          setError('This account is not assigned to a Business Wallet.');
+          router.push('/');
+          return;
+        }
         setWalletBalance(me.wallet?.balance_usd || '0.00');
         setTransactions(mapTransactions(tx.transactions || []));
         setActivityData(buildActivityData(tx.transactions || []));

@@ -26,10 +26,26 @@ async function apiRequest<T>(path: string, options: ApiOptions = {}): Promise<T>
 
 export type LoginResponse = {
   token: string;
-  user: { id: string; email: string; full_name: string | null };
+  user: {
+    id: string;
+    email: string;
+    full_name: string | null;
+    wallet_class:
+      | 'investor'
+      | 'issuer_company'
+      | 'issuer_government'
+      | 'business_vendor'
+      | 'business_contractor';
+  };
 };
 
 export type MeResponse = {
+  wallet_class:
+    | 'investor'
+    | 'issuer_company'
+    | 'issuer_government'
+    | 'business_vendor'
+    | 'business_contractor';
   wallet: { balance_usd: string };
 };
 

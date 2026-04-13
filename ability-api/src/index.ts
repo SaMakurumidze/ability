@@ -2,7 +2,7 @@ import express, { type Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
-import { createHmac } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import { neon } from '@neondatabase/serverless';
 import { signAccessToken, requireJwtSecret } from './auth/jwt';
 import { validateSignupPassword } from './auth/passwordPolicy';
@@ -23,6 +23,24 @@ if (!databaseUrl) {
 const sql = neon(databaseUrl);
 
 const BCRYPT_ROUNDS = 10;
+const WALLET_CLASSES = [
+  'investor',
+  'issuer_company',
+  'issuer_government',
+  'business_vendor',
+  'business_contractor',
+] as const;
+type WalletClass = (typeof WALLET_CLASSES)[number];
+const WALLET_CLASS_SET = new Set<string>(WALLET_CLASSES);
+
+function isWalletClass(value: unknown): value is WalletClass {
+  return typeof value === 'string' && WALLET_CLASS_SET.has(value.trim().toLowerCase());
+}
+
+function normalizeWalletClass(value: unknown, fallback: WalletClass = 'investor'): WalletClass {
+  if (!isWalletClass(value)) return fallback;
+  return value.trim().toLowerCase() as WalletClass;
+}
 
 type KycRow = {
   country: string | null;
@@ -40,6 +58,16 @@ async function loadKycRow(userId: string): Promise<KycRow | null> {
   return (row as KycRow | undefined) ?? null;
 }
 
+async function loadWalletClass(userId: string): Promise<WalletClass> {
+  const [row] = await sql`
+    SELECT wallet_class
+    FROM user_profiles
+    WHERE user_id = ${userId}::uuid
+    LIMIT 1
+  `;
+  return normalizeWalletClass((row as { wallet_class?: string } | undefined)?.wallet_class, 'investor');
+}
+
 function isKycCompleteRow(row: KycRow | null): boolean {
   if (!row) return false;
   const c = row.country?.trim() ?? '';
@@ -52,11 +80,37 @@ async function assertKycComplete(userId: string | null | undefined, res: Respons
     res.status(401).json({ error: 'Unauthorized' });
     return false;
   }
+  const walletClass = await loadWalletClass(userId);
+  if (walletClass !== 'investor') {
+    return true;
+  }
   const row = await loadKycRow(userId);
   if (!isKycCompleteRow(row)) {
     res.status(403).json({
       error: 'Complete KYC (country, national ID, and transaction PIN) in Settings.',
       code: 'KYC_REQUIRED',
+    });
+    return false;
+  }
+  return true;
+}
+
+async function assertWalletClass(
+  userId: string | null | undefined,
+  allowed: WalletClass[],
+  res: Response
+): Promise<boolean> {
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  const walletClass = await loadWalletClass(userId);
+  if (!allowed.includes(walletClass)) {
+    res.status(403).json({
+      error: `Wallet class "${walletClass}" is not permitted for this operation.`,
+      code: 'WALLET_CLASS_NOT_ALLOWED',
+      wallet_class: walletClass,
+      allowed_wallet_classes: allowed,
     });
     return false;
   }
@@ -104,6 +158,30 @@ const PRIVATEEX_API_KEY = process.env.PRIVATEEX_API_KEY || '';
 const PRIVATEEX_WEBHOOK_SECRET = process.env.PRIVATEEX_WEBHOOK_SECRET || PRIVATEEX_API_KEY;
 const PLATFORM_ESCROW_ENTITY_ID =
   process.env.PLATFORM_ESCROW_ENTITY_ID || '00000000-0000-0000-0000-000000000001';
+const PLATFORM_REVENUE_ENTITY_ID =
+  process.env.PLATFORM_REVENUE_ENTITY_ID || '00000000-0000-0000-0000-000000000002';
+const SETTLEMENT_FEE_BPS = Math.max(0, Number(process.env.SETTLEMENT_FEE_BPS || '50'));
+type IssuerEntityType = 'company' | 'government';
+
+function normalizeIssuerEntityType(value: unknown): IssuerEntityType {
+  return String(value || 'company').trim().toLowerCase() === 'government'
+    ? 'government'
+    : 'company';
+}
+
+function issuerEntityIdOrLegacy(
+  issuerEntityId: unknown,
+  companyId: unknown,
+  issuerType: IssuerEntityType
+): string {
+  if (isUuid(issuerEntityId)) return issuerEntityId;
+  if (issuerType === 'company' && isUuid(companyId)) return companyId;
+  return String(issuerEntityId || companyId || '');
+}
+
+function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100;
+}
 
 function isUuid(v: unknown): v is string {
   return (
@@ -180,6 +258,243 @@ async function getOrCreateCompanyWalletAccount(companyId: string) {
   return created as { account_id: string; balance: string };
 }
 
+async function getOrCreateGovernmentWalletAccount(entityId: string) {
+  const [existing] = await sql`
+    SELECT account_id, balance::text AS balance
+    FROM wallet_accounts
+    WHERE entity_id = ${entityId}::uuid
+      AND entity_type = 'government'
+      AND account_type = 'government_wallet'
+    LIMIT 1
+  `;
+  if (existing) return existing as { account_id: string; balance: string };
+  const [created] = await sql`
+    INSERT INTO wallet_accounts (
+      entity_id, entity_type, account_type, currency, balance, status
+    )
+    VALUES (${entityId}::uuid, 'government', 'government_wallet', 'USD', 0, 'ACTIVE')
+    RETURNING account_id, balance::text AS balance
+  `;
+  return created as { account_id: string; balance: string };
+}
+
+async function getOrCreateRevenueWalletAccount() {
+  const [existing] = await sql`
+    SELECT account_id, balance::text AS balance
+    FROM wallet_accounts
+    WHERE entity_id = ${PLATFORM_REVENUE_ENTITY_ID}::uuid
+      AND entity_type = 'platform'
+      AND account_type = 'platform_revenue_wallet'
+    LIMIT 1
+  `;
+  if (existing) return existing as { account_id: string; balance: string };
+  const [created] = await sql`
+    INSERT INTO wallet_accounts (
+      entity_id, entity_type, account_type, currency, balance, status
+    )
+    VALUES (${PLATFORM_REVENUE_ENTITY_ID}::uuid, 'platform', 'platform_revenue_wallet', 'USD', 0, 'ACTIVE')
+    RETURNING account_id, balance::text AS balance
+  `;
+  return created as { account_id: string; balance: string };
+}
+
+async function resolveIssuerSettlementAccount(
+  issuerType: IssuerEntityType,
+  issuerEntityId: string
+): Promise<{ account_id: string; issuer_name: string }> {
+  if (issuerType === 'government') {
+    const [governmentWallet] = await sql`
+      SELECT wa.account_id, ge.department_name
+      FROM government_entities ge
+      JOIN wallet_accounts wa ON wa.account_id = ge.wallet_account_id
+      WHERE ge.entity_id = ${issuerEntityId}::uuid
+      LIMIT 1
+    `;
+    if (!governmentWallet) {
+      throw new Error('Government issuer wallet not configured.');
+    }
+    return {
+      account_id: (governmentWallet as { account_id: string }).account_id,
+      issuer_name: (governmentWallet as { department_name?: string }).department_name || 'Government Issuer',
+    };
+  }
+
+  const [companyWallet] = await sql`
+    SELECT wa.account_id, c.company_name
+    FROM companies c
+    JOIN wallet_accounts wa ON wa.account_id = c.wallet_account_id
+    WHERE c.company_id = ${issuerEntityId}::uuid
+    LIMIT 1
+  `;
+  if (!companyWallet) {
+    throw new Error('Company issuer wallet not configured.');
+  }
+  return {
+    account_id: (companyWallet as { account_id: string }).account_id,
+    issuer_name: (companyWallet as { company_name?: string }).company_name || 'Company Issuer',
+  };
+}
+
+type SettlementInput = {
+  investment_id: string;
+  investment_request_id: string;
+  investor_user_id: string;
+  issuer_entity_type: IssuerEntityType;
+  issuer_entity_id: string;
+  issuer_name: string;
+  total_amount: string;
+  currency: string;
+};
+
+async function processInvestmentSettlement(input: SettlementInput) {
+  const grossAmount = roundMoney(Number(input.total_amount));
+  if (!Number.isFinite(grossAmount) || grossAmount <= 0) {
+    throw new Error('Invalid settlement amount.');
+  }
+
+  const investorAccount = await getOrCreateUserWalletAccount(input.investor_user_id);
+  if (Number(investorAccount.balance) < grossAmount) {
+    throw new Error('Insufficient balance.');
+  }
+  const escrowAccount = await getOrCreateEscrowWalletAccount();
+  const revenueAccount = await getOrCreateRevenueWalletAccount();
+  const issuerAccount = await resolveIssuerSettlementAccount(
+    input.issuer_entity_type,
+    input.issuer_entity_id
+  );
+
+  const feeAmount = roundMoney((grossAmount * SETTLEMENT_FEE_BPS) / 10000);
+  const netAmount = roundMoney(grossAmount - feeAmount);
+  if (netAmount < 0) {
+    throw new Error('Settlement net amount cannot be negative.');
+  }
+
+  const txId = input.investment_request_id;
+  const ccy = input.currency || 'USD';
+  const statements = [
+    sql`
+      UPDATE wallet_accounts
+      SET balance = balance - ${grossAmount.toFixed(2)}::numeric
+      WHERE account_id = ${investorAccount.account_id}::uuid
+    `,
+    sql`
+      UPDATE wallet_accounts
+      SET balance = balance + ${grossAmount.toFixed(2)}::numeric
+      WHERE account_id = ${escrowAccount.account_id}::uuid
+    `,
+    sql`
+      INSERT INTO ledger_entries (
+        transaction_id, account_id, debit, credit, currency, reference_type, reference_id
+      ) VALUES
+      (${txId}::uuid, ${investorAccount.account_id}::uuid, ${grossAmount.toFixed(2)}::numeric, 0, ${ccy}, 'investment_settlement', ${txId}::uuid),
+      (${txId}::uuid, ${escrowAccount.account_id}::uuid, 0, ${grossAmount.toFixed(2)}::numeric, ${ccy}, 'investment_settlement', ${txId}::uuid)
+    `,
+    sql`
+      UPDATE wallet_accounts
+      SET balance = balance - ${grossAmount.toFixed(2)}::numeric
+      WHERE account_id = ${escrowAccount.account_id}::uuid
+    `,
+    sql`
+      UPDATE wallet_accounts
+      SET balance = balance + ${netAmount.toFixed(2)}::numeric
+      WHERE account_id = ${issuerAccount.account_id}::uuid
+    `,
+    sql`
+      INSERT INTO ledger_entries (
+        transaction_id, account_id, debit, credit, currency, reference_type, reference_id
+      ) VALUES
+      (${txId}::uuid, ${escrowAccount.account_id}::uuid, ${grossAmount.toFixed(2)}::numeric, 0, ${ccy}, 'investment_settlement', ${txId}::uuid),
+      (${txId}::uuid, ${issuerAccount.account_id}::uuid, 0, ${netAmount.toFixed(2)}::numeric, ${ccy}, 'investment_settlement', ${txId}::uuid)
+    `,
+    sql`
+      UPDATE wallets
+      SET balance_usd = balance_usd - ${grossAmount.toFixed(2)}::numeric, updated_at = NOW()
+      WHERE user_id = ${input.investor_user_id}::uuid
+    `,
+    sql`
+      UPDATE pending_investments
+      SET
+        status = 'authorized',
+        settlement_status = 'settled',
+        fee_amount = ${feeAmount.toFixed(2)}::numeric,
+        net_amount = ${netAmount.toFixed(2)}::numeric,
+        settlement_completed_at = NOW()
+      WHERE id = ${input.investment_id}::uuid
+    `,
+    sql`
+      INSERT INTO transactions (user_id, transaction_type, amount_usd, status, company_name, description)
+      VALUES (
+        ${input.investor_user_id}::uuid,
+        'INVEST',
+        ${grossAmount.toFixed(2)}::numeric,
+        'CONFIRMED',
+        ${input.issuer_name},
+        ${`Settlement ${txId} (fee ${feeAmount.toFixed(2)}, net ${netAmount.toFixed(2)})`}
+      )
+    `,
+    sql`
+      INSERT INTO investment_settlements (
+        investment_request_id,
+        pending_investment_id,
+        investor_user_id,
+        issuer_entity_type,
+        issuer_entity_id,
+        gross_amount,
+        fee_amount,
+        net_amount,
+        currency,
+        status,
+        processed_at
+      )
+      VALUES (
+        ${txId}::uuid,
+        ${input.investment_id}::uuid,
+        ${input.investor_user_id}::uuid,
+        ${input.issuer_entity_type},
+        ${input.issuer_entity_id}::uuid,
+        ${grossAmount.toFixed(2)}::numeric,
+        ${feeAmount.toFixed(2)}::numeric,
+        ${netAmount.toFixed(2)}::numeric,
+        ${ccy},
+        'settled',
+        NOW()
+      )
+      ON CONFLICT (investment_request_id)
+      DO UPDATE SET
+        fee_amount = EXCLUDED.fee_amount,
+        net_amount = EXCLUDED.net_amount,
+        status = EXCLUDED.status,
+        processed_at = EXCLUDED.processed_at
+    `,
+  ];
+
+  if (feeAmount > 0) {
+    statements.splice(
+      6,
+      0,
+      sql`
+        UPDATE wallet_accounts
+        SET balance = balance + ${feeAmount.toFixed(2)}::numeric
+        WHERE account_id = ${revenueAccount.account_id}::uuid
+      `,
+      sql`
+        INSERT INTO ledger_entries (
+          transaction_id, account_id, debit, credit, currency, reference_type, reference_id
+        ) VALUES
+        (${txId}::uuid, ${revenueAccount.account_id}::uuid, 0, ${feeAmount.toFixed(2)}::numeric, ${ccy}, 'settlement_fee', ${txId}::uuid)
+      `
+    );
+  }
+
+  await sql.transaction(statements);
+  return {
+    gross_amount: grossAmount.toFixed(2),
+    fee_amount: feeAmount.toFixed(2),
+    net_amount: netAmount.toFixed(2),
+    currency: ccy,
+  };
+}
+
 async function sendPrivateExWebhook(payload: Record<string, unknown>) {
   try {
     const body = JSON.stringify(payload);
@@ -219,6 +534,7 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS user_profiles (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       full_name TEXT NOT NULL,
+      wallet_class TEXT NOT NULL DEFAULT 'investor',
       national_id TEXT UNIQUE,
       country TEXT,
       biometric_enabled BOOLEAN NOT NULL DEFAULT false,
@@ -233,12 +549,49 @@ async function ensureSchema() {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
       balance_usd NUMERIC(14,2) NOT NULL DEFAULT 1000,
-      wallet_type TEXT NOT NULL DEFAULT 'INDIVIDUAL',
+      wallet_type TEXT NOT NULL DEFAULT 'investor',
       status TEXT NOT NULL DEFAULT 'ACTIVE',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
+  await sql`ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS wallet_class TEXT`;
+  await sql`UPDATE user_profiles SET wallet_class = 'investor' WHERE wallet_class IS NULL OR wallet_class NOT IN ('investor','issuer_company','issuer_government','business_vendor','business_contractor')`;
+  await sql`ALTER TABLE user_profiles ALTER COLUMN wallet_class SET DEFAULT 'investor'`;
+  await sql`ALTER TABLE user_profiles ALTER COLUMN wallet_class SET NOT NULL`;
+  await sql`ALTER TABLE wallets ALTER COLUMN wallet_type SET DEFAULT 'investor'`;
+  await sql`UPDATE wallets SET wallet_type = 'investor' WHERE wallet_type IS NULL OR wallet_type = 'INDIVIDUAL'`;
+  await sql`UPDATE wallets w SET wallet_type = up.wallet_class FROM user_profiles up WHERE up.user_id = w.user_id AND w.wallet_type <> up.wallet_class`;
+  await sql`ALTER TABLE wallets ALTER COLUMN wallet_type SET NOT NULL`;
+  await sql`ALTER TABLE user_profiles DROP CONSTRAINT IF EXISTS user_profiles_wallet_class_check`;
+  await sql`ALTER TABLE user_profiles ADD CONSTRAINT user_profiles_wallet_class_check CHECK (wallet_class IN ('investor','issuer_company','issuer_government','business_vendor','business_contractor'))`;
+  await sql`ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_wallet_type_check`;
+  await sql`ALTER TABLE wallets ADD CONSTRAINT wallets_wallet_type_check CHECK (wallet_type IN ('investor','issuer_company','issuer_government','business_vendor','business_contractor'))`;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS issuer_wallet_profiles (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      issuer_kind TEXT NOT NULL CHECK (issuer_kind IN ('company','government')),
+      issuer_name TEXT NOT NULL,
+      company_id UUID,
+      government_entity_id UUID,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS business_wallet_profiles (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      business_type TEXT NOT NULL CHECK (business_type IN ('vendor','contractor')),
+      business_name TEXT NOT NULL,
+      linked_issuer_user_id UUID REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+  await sql`ALTER TABLE issuer_wallet_profiles ADD COLUMN IF NOT EXISTS company_id UUID`;
+  await sql`ALTER TABLE issuer_wallet_profiles ADD COLUMN IF NOT EXISTS government_entity_id UUID`;
+  await sql`ALTER TABLE business_wallet_profiles ADD COLUMN IF NOT EXISTS linked_issuer_user_id UUID REFERENCES users(id)`;
   await sql`ALTER TABLE wallets ALTER COLUMN balance_usd SET DEFAULT 1000`;
 
   await sql`
@@ -305,17 +658,29 @@ async function ensureSchema() {
   await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS share_quantity INTEGER`;
   await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS currency VARCHAR DEFAULT 'USD'`;
   await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS origin VARCHAR DEFAULT 'privateex'`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS issuer_entity_type VARCHAR DEFAULT 'company'`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS issuer_entity_id UUID`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS settlement_status VARCHAR DEFAULT 'pending'`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS settlement_completed_at TIMESTAMPTZ`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(14,2) DEFAULT 0`;
+  await sql`ALTER TABLE pending_investments ADD COLUMN IF NOT EXISTS net_amount NUMERIC(14,2) DEFAULT 0`;
   await sql`ALTER TABLE pending_investments ALTER COLUMN status SET DEFAULT 'pending_authorization'`;
   await sql`
     UPDATE pending_investments
     SET
       ability_reference_id = COALESCE(ability_reference_id, id),
       investment_request_id = COALESCE(investment_request_id, id),
+      issuer_entity_type = COALESCE(issuer_entity_type, 'company'),
+      issuer_entity_id = COALESCE(issuer_entity_id, company_id),
+      settlement_status = COALESCE(settlement_status, 'pending'),
+      fee_amount = COALESCE(fee_amount, 0),
+      net_amount = COALESCE(net_amount, total_amount),
       share_quantity = COALESCE(share_quantity, number_of_shares),
       currency = COALESCE(currency, 'USD'),
       origin = COALESCE(origin, 'ability')
     WHERE ability_reference_id IS NULL
        OR investment_request_id IS NULL
+       OR issuer_entity_type IS NULL
        OR share_quantity IS NULL
        OR currency IS NULL
        OR origin IS NULL
@@ -325,8 +690,13 @@ async function ensureSchema() {
   await sql`ALTER TABLE pending_investments ALTER COLUMN share_quantity SET NOT NULL`;
   await sql`ALTER TABLE pending_investments ALTER COLUMN currency SET NOT NULL`;
   await sql`ALTER TABLE pending_investments ALTER COLUMN origin SET NOT NULL`;
+  await sql`ALTER TABLE pending_investments DROP CONSTRAINT IF EXISTS pending_investments_issuer_entity_type_check`;
+  await sql`ALTER TABLE pending_investments ADD CONSTRAINT pending_investments_issuer_entity_type_check CHECK (issuer_entity_type IN ('company','government'))`;
+  await sql`ALTER TABLE pending_investments DROP CONSTRAINT IF EXISTS pending_investments_settlement_status_check`;
+  await sql`ALTER TABLE pending_investments ADD CONSTRAINT pending_investments_settlement_status_check CHECK (settlement_status IN ('pending','settled','failed'))`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS pending_investments_ability_reference_id_idx ON pending_investments(ability_reference_id)`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS pending_investments_investment_request_id_idx ON pending_investments(investment_request_id)`;
+  await sql`CREATE INDEX IF NOT EXISTS pending_investments_settlement_status_idx ON pending_investments(settlement_status)`;
 
   await sql`DO $$ BEGIN CREATE TYPE entity_type_enum AS ENUM ('user','company','government','platform'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;`;
   await sql`
@@ -341,6 +711,7 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS wallet_accounts_entity_account_unique_idx ON wallet_accounts(entity_id, entity_type, account_type)`;
 
   await sql`
     CREATE TABLE IF NOT EXISTS companies (
@@ -374,6 +745,24 @@ async function ensureSchema() {
       currency VARCHAR NOT NULL DEFAULT 'USD',
       reference_type VARCHAR NOT NULL,
       reference_id UUID NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS investment_settlements (
+      settlement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      investment_request_id UUID NOT NULL UNIQUE,
+      pending_investment_id UUID NOT NULL REFERENCES pending_investments(id),
+      investor_user_id UUID NOT NULL REFERENCES users(id),
+      issuer_entity_type VARCHAR NOT NULL CHECK (issuer_entity_type IN ('company','government')),
+      issuer_entity_id UUID NOT NULL,
+      gross_amount NUMERIC(14,2) NOT NULL,
+      fee_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+      net_amount NUMERIC(14,2) NOT NULL,
+      currency VARCHAR NOT NULL DEFAULT 'USD',
+      status VARCHAR NOT NULL DEFAULT 'settled',
+      processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
@@ -759,7 +1148,8 @@ async function insertUserWithSatellites(
   emailTrim: string,
   phoneTrim: string,
   password_hash: string,
-  fullNameTrim: string
+  fullNameTrim: string,
+  walletClass: WalletClass = 'investor'
 ): Promise<string> {
   const rows = await sql`
     WITH u AS (
@@ -768,12 +1158,12 @@ async function insertUserWithSatellites(
       RETURNING id
     ),
     _p AS (
-      INSERT INTO user_profiles (user_id, full_name)
-      SELECT id, ${fullNameTrim} FROM u
+      INSERT INTO user_profiles (user_id, full_name, wallet_class)
+      SELECT id, ${fullNameTrim}, ${walletClass} FROM u
     ),
     _w AS (
-      INSERT INTO wallets (user_id, balance_usd)
-      SELECT id, 1000 FROM u
+      INSERT INTO wallets (user_id, balance_usd, wallet_type)
+      SELECT id, 1000, ${walletClass} FROM u
     ),
     _s AS (
       INSERT INTO user_settings (user_id)
@@ -796,7 +1186,8 @@ async function tryResumeSignup(
   emailTrim: string,
   phoneTrim: string,
   password: string,
-  fullNameTrim: string
+  fullNameTrim: string,
+  walletClass: WalletClass = 'investor'
 ): Promise<
   { ok: true; userId: string; email: string; full_name: string } | { ok: false; message: string }
 > {
@@ -817,13 +1208,15 @@ async function tryResumeSignup(
     };
   }
   await sql`
-    INSERT INTO user_profiles (user_id, full_name)
-    VALUES (${r.id}::uuid, ${fullNameTrim})
-    ON CONFLICT (user_id) DO NOTHING
+    INSERT INTO user_profiles (user_id, full_name, wallet_class)
+    VALUES (${r.id}::uuid, ${fullNameTrim}, ${walletClass})
+    ON CONFLICT (user_id)
+    DO UPDATE SET wallet_class = EXCLUDED.wallet_class
   `;
   await sql`
-    INSERT INTO wallets (user_id, balance_usd) VALUES (${r.id}::uuid, 1000)
-    ON CONFLICT (user_id) DO NOTHING
+    INSERT INTO wallets (user_id, balance_usd, wallet_type) VALUES (${r.id}::uuid, 1000, ${walletClass})
+    ON CONFLICT (user_id)
+    DO UPDATE SET wallet_type = EXCLUDED.wallet_type
   `;
   await sql`
     INSERT INTO user_settings (user_id) VALUES (${r.id}::uuid)
@@ -836,9 +1229,132 @@ async function tryResumeSignup(
   return { ok: true, userId: r.id, email: r.email, full_name: fn };
 }
 
+async function upsertWalletClassArtifacts(
+  userId: string,
+  walletClass: WalletClass,
+  data: Record<string, unknown>
+) {
+  await sql`
+    UPDATE user_profiles
+    SET wallet_class = ${walletClass}, updated_at = NOW()
+    WHERE user_id = ${userId}::uuid
+  `;
+  await sql`
+    UPDATE wallets
+    SET wallet_type = ${walletClass}, updated_at = NOW()
+    WHERE user_id = ${userId}::uuid
+  `;
+
+  if (walletClass === 'issuer_company') {
+    const companyId = isUuid(data.company_id) ? (data.company_id as string) : randomUUID();
+    const issuerName = String(data.issuer_name || data.company_name || 'Company Issuer').trim();
+    const wallet = await getOrCreateCompanyWalletAccount(companyId);
+    await sql`
+      INSERT INTO companies (
+        company_id, company_name, registration_number, country, industry, wallet_account_id
+      )
+      VALUES (
+        ${companyId}::uuid,
+        ${issuerName},
+        ${typeof data.registration_number === 'string' ? data.registration_number.trim() : null},
+        ${typeof data.country === 'string' ? data.country.trim() : null},
+        ${typeof data.industry === 'string' ? data.industry.trim() : null},
+        ${wallet.account_id}::uuid
+      )
+      ON CONFLICT (company_id)
+      DO UPDATE SET
+        company_name = EXCLUDED.company_name,
+        registration_number = EXCLUDED.registration_number,
+        country = EXCLUDED.country,
+        industry = EXCLUDED.industry,
+        wallet_account_id = EXCLUDED.wallet_account_id
+    `;
+    await sql`
+      INSERT INTO issuer_wallet_profiles (user_id, issuer_kind, issuer_name, company_id, government_entity_id, updated_at)
+      VALUES (${userId}::uuid, 'company', ${issuerName}, ${companyId}::uuid, NULL, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        issuer_kind = EXCLUDED.issuer_kind,
+        issuer_name = EXCLUDED.issuer_name,
+        company_id = EXCLUDED.company_id,
+        government_entity_id = EXCLUDED.government_entity_id,
+        updated_at = NOW()
+    `;
+    await sql`DELETE FROM business_wallet_profiles WHERE user_id = ${userId}::uuid`;
+    return;
+  }
+
+  if (walletClass === 'issuer_government') {
+    const entityId = isUuid(data.government_entity_id) ? (data.government_entity_id as string) : randomUUID();
+    const issuerName = String(data.issuer_name || data.department_name || 'Government Issuer').trim();
+    const wallet = await getOrCreateGovernmentWalletAccount(entityId);
+    await sql`
+      INSERT INTO government_entities (
+        entity_id, department_name, country, wallet_account_id
+      )
+      VALUES (
+        ${entityId}::uuid,
+        ${issuerName},
+        ${typeof data.country === 'string' ? data.country.trim() : null},
+        ${wallet.account_id}::uuid
+      )
+      ON CONFLICT (entity_id)
+      DO UPDATE SET
+        department_name = EXCLUDED.department_name,
+        country = EXCLUDED.country,
+        wallet_account_id = EXCLUDED.wallet_account_id
+    `;
+    await sql`
+      INSERT INTO issuer_wallet_profiles (user_id, issuer_kind, issuer_name, company_id, government_entity_id, updated_at)
+      VALUES (${userId}::uuid, 'government', ${issuerName}, NULL, ${entityId}::uuid, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        issuer_kind = EXCLUDED.issuer_kind,
+        issuer_name = EXCLUDED.issuer_name,
+        company_id = EXCLUDED.company_id,
+        government_entity_id = EXCLUDED.government_entity_id,
+        updated_at = NOW()
+    `;
+    await sql`DELETE FROM business_wallet_profiles WHERE user_id = ${userId}::uuid`;
+    return;
+  }
+
+  if (walletClass === 'business_vendor' || walletClass === 'business_contractor') {
+    const businessType = walletClass === 'business_vendor' ? 'vendor' : 'contractor';
+    const businessName = String(data.business_name || data.full_name || 'Business Wallet Holder').trim();
+    await sql`
+      INSERT INTO business_wallet_profiles (user_id, business_type, business_name, linked_issuer_user_id, updated_at)
+      VALUES (
+        ${userId}::uuid,
+        ${businessType},
+        ${businessName},
+        ${isUuid(data.linked_issuer_user_id) ? (data.linked_issuer_user_id as string) : null}::uuid,
+        NOW()
+      )
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        business_type = EXCLUDED.business_type,
+        business_name = EXCLUDED.business_name,
+        linked_issuer_user_id = EXCLUDED.linked_issuer_user_id,
+        updated_at = NOW()
+    `;
+    await sql`DELETE FROM issuer_wallet_profiles WHERE user_id = ${userId}::uuid`;
+    return;
+  }
+
+  await sql`DELETE FROM issuer_wallet_profiles WHERE user_id = ${userId}::uuid`;
+  await sql`DELETE FROM business_wallet_profiles WHERE user_id = ${userId}::uuid`;
+}
+
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { fullName, email, phone, password } = req.body ?? {};
+    const { fullName, email, phone, password, wallet_class } = req.body ?? {};
+    if (wallet_class && normalizeWalletClass(wallet_class, 'investor') !== 'investor') {
+      return res.status(403).json({
+        error:
+          'Public signup is limited to Investor Wallets. Issuer and Business wallets must be provisioned by an admin.',
+      });
+    }
     const fullNameTrim = typeof fullName === 'string' ? fullName.trim() : '';
     const emailTrim = typeof email === 'string' ? email.trim().toLowerCase() : '';
     const phoneTrim = typeof phone === 'string' ? phone.trim() : '';
@@ -855,17 +1371,17 @@ app.post('/api/auth/register', async (req, res) => {
     const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
     try {
-      const userId = await insertUserWithSatellites(emailTrim, phoneTrim, password_hash, fullNameTrim);
+      const userId = await insertUserWithSatellites(emailTrim, phoneTrim, password_hash, fullNameTrim, 'investor');
       const token = signAccessToken(userId);
       return res.status(201).json({
         token,
-        user: { id: userId, email: emailTrim, full_name: fullNameTrim },
+        user: { id: userId, email: emailTrim, full_name: fullNameTrim, wallet_class: 'investor' },
       });
     } catch (first: any) {
       if (first?.code !== '23505') {
         throw first;
       }
-      const resumed = await tryResumeSignup(emailTrim, phoneTrim, password, fullNameTrim);
+      const resumed = await tryResumeSignup(emailTrim, phoneTrim, password, fullNameTrim, 'investor');
       if (resumed.ok) {
         const token = signAccessToken(resumed.userId);
         return res.status(200).json({
@@ -874,6 +1390,7 @@ app.post('/api/auth/register', async (req, res) => {
             id: resumed.userId,
             email: resumed.email,
             full_name: resumed.full_name,
+            wallet_class: 'investor',
           },
           resumed: true,
         });
@@ -898,14 +1415,14 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const [row] = await sql`
-      SELECT u.id, u.email, u.password_hash, up.full_name
+      SELECT u.id, u.email, u.password_hash, up.full_name, up.wallet_class
       FROM users u
       LEFT JOIN user_profiles up ON up.user_id = u.id
       WHERE u.phone = ${phoneTrim}
       LIMIT 1
     `;
     const r = row as
-      | { id: string; email: string; password_hash: string; full_name: string | null }
+      | { id: string; email: string; password_hash: string; full_name: string | null; wallet_class: string | null }
       | undefined;
     if (!r || !(await bcrypt.compare(password, r.password_hash))) {
       return res.status(401).json({ error: 'Invalid phone or password.' });
@@ -915,7 +1432,12 @@ app.post('/api/auth/login', async (req, res) => {
     const full_name = typeof r.full_name === 'string' ? r.full_name.trim() : '';
     return res.json({
       token,
-      user: { id: r.id, email: r.email, full_name: full_name || null },
+      user: {
+        id: r.id,
+        email: r.email,
+        full_name: full_name || null,
+        wallet_class: normalizeWalletClass(r.wallet_class, 'investor'),
+      },
     });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Login failed.' });
@@ -933,6 +1455,7 @@ app.get('/api/me', requireAuth(), async (req, res) => {
       SELECT
         up.user_id AS id,
         up.full_name,
+        up.wallet_class,
         u.phone,
         u.email,
         up.country,
@@ -946,9 +1469,11 @@ app.get('/api/me', requireAuth(), async (req, res) => {
     `;
 
     let profile: Record<string, unknown> | null = null;
+    let walletClass: WalletClass = 'investor';
     let kyc_complete = false;
     if (profileRow) {
       const { pin_hash: _ph, ...rest } = profileRow as Record<string, unknown> & { pin_hash?: string | null };
+      walletClass = normalizeWalletClass(rest.wallet_class, 'investor');
       kyc_complete = isKycCompleteRow({
         country: rest.country as string | null,
         national_id: rest.national_id as string | null,
@@ -969,10 +1494,26 @@ app.get('/api/me', requireAuth(), async (req, res) => {
       LIMIT 1
     `;
 
+    const [issuerProfile] = await sql`
+      SELECT issuer_kind, issuer_name, company_id, government_entity_id
+      FROM issuer_wallet_profiles
+      WHERE user_id = ${userId}::uuid
+      LIMIT 1
+    `;
+    const [businessProfile] = await sql`
+      SELECT business_type, business_name, linked_issuer_user_id
+      FROM business_wallet_profiles
+      WHERE user_id = ${userId}::uuid
+      LIMIT 1
+    `;
+
     return res.json({
+      wallet_class: walletClass,
       kyc_complete,
       profile: profile ?? null,
       wallet: wallet ?? { balance_usd: '0.00' },
+      issuer_profile: issuerProfile ?? null,
+      business_profile: businessProfile ?? null,
       settings: settings ?? { currency: 'USD', notifications_enabled: true, theme: 'auto' },
     });
   } catch (error: any) {
@@ -1087,6 +1628,7 @@ app.get('/api/banks', requireAuth(), async (req, res) => {
 app.get('/api/pending-investments', requireAuth(), async (req, res) => {
   try {
     const { userId } = getAuth(req);
+    if (!(await assertWalletClass(userId, ['investor'], res))) return;
     if (!(await assertKycComplete(userId, res))) return;
 
     const rows = await sql`
@@ -1120,16 +1662,24 @@ app.post('/api/investments/request', async (req, res) => {
       investment_request_id,
       user_id,
       company_id,
+      issuer_type,
+      issuer_entity_id,
       share_quantity,
       total_amount,
       currency,
       origin,
     } = req.body ?? {};
+    const issuerEntityType = normalizeIssuerEntityType(issuer_type);
+    const resolvedIssuerEntityId = issuerEntityIdOrLegacy(
+      issuer_entity_id,
+      company_id,
+      issuerEntityType
+    );
 
     if (
       !isUuid(investment_request_id) ||
       !isUuid(user_id) ||
-      !isUuid(company_id) ||
+      !isUuid(resolvedIssuerEntityId) ||
       !Number.isInteger(Number(share_quantity)) ||
       Number(share_quantity) <= 0
     ) {
@@ -1142,12 +1692,33 @@ app.post('/api/investments/request', async (req, res) => {
     const ccy = String(currency || 'USD').trim().toUpperCase();
     const orig = String(origin || 'privateex').trim().toLowerCase();
 
-    const [company] = await sql`
-      SELECT company_name
-      FROM companies
-      WHERE company_id = ${company_id}::uuid
+    let issuerName = 'PrivateEx Issuer';
+    if (issuerEntityType === 'government') {
+      const [government] = await sql`
+        SELECT department_name
+        FROM government_entities
+        WHERE entity_id = ${resolvedIssuerEntityId}::uuid
+        LIMIT 1
+      `;
+      issuerName = (government as { department_name?: string } | undefined)?.department_name || issuerName;
+    } else {
+      const [company] = await sql`
+        SELECT company_name
+        FROM companies
+        WHERE company_id = ${resolvedIssuerEntityId}::uuid
+        LIMIT 1
+      `;
+      issuerName = (company as { company_name?: string } | undefined)?.company_name || issuerName;
+    }
+    const [targetUser] = await sql`
+      SELECT wallet_class
+      FROM user_profiles
+      WHERE user_id = ${user_id}::uuid
       LIMIT 1
     `;
+    if (normalizeWalletClass((targetUser as { wallet_class?: string } | undefined)?.wallet_class, 'investor') !== 'investor') {
+      return res.status(400).json({ error: 'Investment requests can only target Investor Wallet holders.' });
+    }
 
     const [inserted] = await sql`
       INSERT INTO pending_investments (
@@ -1156,6 +1727,8 @@ app.post('/api/investments/request', async (req, res) => {
         investment_request_id,
         user_id,
         company_id,
+        issuer_entity_type,
+        issuer_entity_id,
         company_name,
         number_of_shares,
         share_quantity,
@@ -1163,6 +1736,7 @@ app.post('/api/investments/request', async (req, res) => {
         price_per_share,
         currency,
         status,
+        settlement_status,
         origin
       )
       VALUES (
@@ -1170,26 +1744,32 @@ app.post('/api/investments/request', async (req, res) => {
         ${investment_request_id}::uuid,
         ${investment_request_id}::uuid,
         ${user_id}::uuid,
-        ${company_id}::uuid,
-        ${((company as { company_name?: string } | undefined)?.company_name ?? 'PrivateEx Company')},
+        ${issuerEntityType === 'company' ? resolvedIssuerEntityId : null}::uuid,
+        ${issuerEntityType},
+        ${resolvedIssuerEntityId}::uuid,
+        ${issuerName},
         ${Number(share_quantity)},
         ${Number(share_quantity)},
         ${amount.toFixed(2)}::numeric,
         ${(amount / Number(share_quantity)).toFixed(2)}::numeric,
         ${ccy},
         'pending_authorization',
+        'pending',
         ${orig}
       )
       ON CONFLICT (investment_request_id)
       DO UPDATE SET
         user_id = EXCLUDED.user_id,
         company_id = EXCLUDED.company_id,
+        issuer_entity_type = EXCLUDED.issuer_entity_type,
+        issuer_entity_id = EXCLUDED.issuer_entity_id,
         company_name = EXCLUDED.company_name,
         number_of_shares = EXCLUDED.number_of_shares,
         share_quantity = EXCLUDED.share_quantity,
         total_amount = EXCLUDED.total_amount,
         price_per_share = EXCLUDED.price_per_share,
         currency = EXCLUDED.currency,
+        settlement_status = 'pending',
         origin = EXCLUDED.origin
       RETURNING ability_reference_id
     `;
@@ -1240,9 +1820,140 @@ app.post('/api/admin/companies/upsert', requireAuth(), async (req, res) => {
   }
 });
 
+app.post('/api/admin/government-entities/upsert', requireAuth(), async (req, res) => {
+  try {
+    const { userId } = getAuth(req);
+    if (!userId || !isAdmin(userId)) {
+      return res.status(403).json({ error: 'Admin access required.' });
+    }
+    const { entity_id, department_name, country } = req.body ?? {};
+    if (!isUuid(entity_id) || typeof department_name !== 'string' || !department_name.trim()) {
+      return res.status(400).json({ error: 'entity_id and department_name are required.' });
+    }
+    const wallet = await getOrCreateGovernmentWalletAccount(entity_id);
+    await sql`
+      INSERT INTO government_entities (
+        entity_id, department_name, country, wallet_account_id
+      )
+      VALUES (
+        ${entity_id}::uuid,
+        ${department_name.trim()},
+        ${typeof country === 'string' ? country.trim() : null},
+        ${wallet.account_id}::uuid
+      )
+      ON CONFLICT (entity_id)
+      DO UPDATE SET
+        department_name = EXCLUDED.department_name,
+        country = EXCLUDED.country,
+        wallet_account_id = EXCLUDED.wallet_account_id
+    `;
+    return res.json({ ok: true, entity_id, wallet_account_id: wallet.account_id });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Failed to upsert government entity.' });
+  }
+});
+
+app.get('/api/admin/settlements/:investmentRequestId', requireAuth(), async (req, res) => {
+  try {
+    const { userId } = getAuth(req);
+    if (!userId || !isAdmin(userId)) {
+      return res.status(403).json({ error: 'Admin access required.' });
+    }
+    const { investmentRequestId } = req.params;
+    if (!isUuid(investmentRequestId)) {
+      return res.status(400).json({ error: 'Invalid investmentRequestId.' });
+    }
+    const [row] = await sql`
+      SELECT
+        settlement_id,
+        investment_request_id,
+        pending_investment_id,
+        investor_user_id,
+        issuer_entity_type,
+        issuer_entity_id,
+        gross_amount::text AS gross_amount,
+        fee_amount::text AS fee_amount,
+        net_amount::text AS net_amount,
+        currency,
+        status,
+        processed_at::text AS processed_at,
+        created_at::text AS created_at
+      FROM investment_settlements
+      WHERE investment_request_id = ${investmentRequestId}::uuid
+      LIMIT 1
+    `;
+    if (!row) {
+      return res.status(404).json({ error: 'Settlement not found.' });
+    }
+    return res.json({ settlement: row });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Failed to load settlement.' });
+  }
+});
+
+app.post('/api/admin/wallet-holders/upsert', requireAuth(), async (req, res) => {
+  try {
+    const { userId } = getAuth(req);
+    if (!userId || !isAdmin(userId)) {
+      return res.status(403).json({ error: 'Admin access required.' });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const walletClass = normalizeWalletClass(body.wallet_class, 'investor');
+    let targetUserId = isUuid(body.user_id) ? (body.user_id as string) : null;
+
+    const fullName = typeof body.full_name === 'string' ? body.full_name.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+
+    if (!targetUserId) {
+      if (!fullName || !email || !phone || !password) {
+        return res.status(400).json({
+          error:
+            'For new wallet holder creation, full_name, email, phone, and password are required.',
+        });
+      }
+      const pwdErr = validateSignupPassword(password);
+      if (pwdErr) {
+        return res.status(400).json({ error: pwdErr });
+      }
+      const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      targetUserId = await insertUserWithSatellites(email, phone, passwordHash, fullName, walletClass);
+    } else {
+      const [existing] = await sql`
+        SELECT id
+        FROM users
+        WHERE id = ${targetUserId}::uuid
+        LIMIT 1
+      `;
+      if (!existing) {
+        return res.status(404).json({ error: 'Target user not found.' });
+      }
+      if (fullName) {
+        await sql`
+          UPDATE user_profiles
+          SET full_name = ${fullName}, updated_at = NOW()
+          WHERE user_id = ${targetUserId}::uuid
+        `;
+      }
+    }
+
+    await upsertWalletClassArtifacts(targetUserId, walletClass, body);
+
+    return res.json({ ok: true, user_id: targetUserId, wallet_class: walletClass });
+  } catch (error: any) {
+    if (error?.code === '23505') {
+      return res.status(409).json({ error: 'A conflicting wallet holder record already exists.' });
+    }
+    return res.status(500).json({ error: error.message || 'Failed to upsert wallet holder.' });
+  }
+});
+
 app.post('/api/pending-investments/:id/authorize', requireAuth(), async (req, res) => {
   try {
     const { userId } = getAuth(req);
+    if (!(await assertWalletClass(userId, ['investor'], res))) return;
     const { pin } = req.body ?? {};
     if (!(await assertKycAndTransactionPin(userId, pin, res))) return;
     const { id } = req.params;
@@ -1253,6 +1964,8 @@ app.post('/api/pending-investments/:id/authorize', requireAuth(), async (req, re
         ability_reference_id,
         investment_request_id,
         company_id,
+        issuer_entity_type,
+        issuer_entity_id,
         company_name,
         total_amount::text AS total_amount,
         COALESCE(currency, 'USD') AS currency
@@ -1278,84 +1991,58 @@ app.post('/api/pending-investments/:id/authorize', requireAuth(), async (req, re
       return res.status(404).json({ error: 'Investment not found.' });
     }
 
-    const amount = Number(inv.total_amount);
-    const investorAccount = await getOrCreateUserWalletAccount(userId!);
-    if (Number(investorAccount.balance) < amount) {
-      return res.status(400).json({ error: 'Insufficient balance.' });
-    }
-    const escrowAccount = await getOrCreateEscrowWalletAccount();
-    const [companyWallet] = await sql`
-      SELECT wa.account_id, wa.balance::text AS balance
-      FROM companies c
-      JOIN wallet_accounts wa ON wa.account_id = c.wallet_account_id
-      WHERE c.company_id = ${((inv as { company_id?: string }).company_id ?? null)}::uuid
-      LIMIT 1
-    `;
-    if (!companyWallet) {
-      return res.status(400).json({ error: 'Company wallet not configured.' });
+    const issuerEntityId =
+      ((inv as { issuer_entity_id?: string }).issuer_entity_id as string) ||
+      ((inv as { company_id?: string }).company_id as string);
+    if (!isUuid(issuerEntityId)) {
+      return res.status(400).json({ error: 'Issuer wallet target is not configured on this investment.' });
     }
 
-    const txId = ((inv as { investment_request_id: string }).investment_request_id || (inv as { id: string }).id);
-    const ccy = String((inv as { currency?: string }).currency || 'USD');
-    const companyAccountId = (companyWallet as { account_id: string }).account_id;
-    await sql.transaction([
-      sql`
-        UPDATE wallet_accounts
-        SET balance = balance - ${amount.toFixed(2)}::numeric
-        WHERE account_id = ${investorAccount.account_id}::uuid
-      `,
-      sql`
-        UPDATE wallet_accounts
-        SET balance = balance + ${amount.toFixed(2)}::numeric
-        WHERE account_id = ${escrowAccount.account_id}::uuid
-      `,
-      sql`
-        INSERT INTO ledger_entries (
-          transaction_id, account_id, debit, credit, currency, reference_type, reference_id
-        ) VALUES
-        (${txId}::uuid, ${investorAccount.account_id}::uuid, ${amount.toFixed(2)}::numeric, 0, ${ccy}, 'investment', ${txId}::uuid),
-        (${txId}::uuid, ${escrowAccount.account_id}::uuid, 0, ${amount.toFixed(2)}::numeric, ${ccy}, 'investment', ${txId}::uuid)
-      `,
-      sql`
-        UPDATE wallet_accounts
-        SET balance = balance - ${amount.toFixed(2)}::numeric
-        WHERE account_id = ${escrowAccount.account_id}::uuid
-      `,
-      sql`
-        UPDATE wallet_accounts
-        SET balance = balance + ${amount.toFixed(2)}::numeric
-        WHERE account_id = ${companyAccountId}::uuid
-      `,
-      sql`
-        INSERT INTO ledger_entries (
-          transaction_id, account_id, debit, credit, currency, reference_type, reference_id
-        ) VALUES
-        (${txId}::uuid, ${escrowAccount.account_id}::uuid, ${amount.toFixed(2)}::numeric, 0, ${ccy}, 'investment', ${txId}::uuid),
-        (${txId}::uuid, ${companyAccountId}::uuid, 0, ${amount.toFixed(2)}::numeric, ${ccy}, 'investment', ${txId}::uuid)
-      `,
-      sql`
-        UPDATE wallets SET balance_usd = balance_usd - ${amount.toFixed(2)}::numeric, updated_at = NOW()
-        WHERE user_id = ${userId}
-      `,
-      sql`
-        UPDATE pending_investments SET status = 'authorized'
-        WHERE id = ${(inv as { id: string }).id}::uuid
-      `,
-      sql`
-        INSERT INTO transactions (user_id, transaction_type, amount_usd, status, company_name, description)
-        VALUES (${userId}, 'INVEST', ${amount.toFixed(2)}::numeric, 'CONFIRMED', ${(inv as { company_name?: string }).company_name ?? 'Company'}, ${`PrivateEx investment ${(inv as { investment_request_id?: string }).investment_request_id || (inv as { id: string }).id}`})
-      `,
-    ]);
+    let settlement: {
+      gross_amount: string;
+      fee_amount: string;
+      net_amount: string;
+      currency: string;
+    };
+    try {
+      settlement = await processInvestmentSettlement({
+      investment_id: (inv as { id: string }).id,
+      investment_request_id:
+        (inv as { investment_request_id?: string; id: string }).investment_request_id ||
+        (inv as { id: string }).id,
+      investor_user_id: userId!,
+      issuer_entity_type: normalizeIssuerEntityType(
+        (inv as { issuer_entity_type?: string }).issuer_entity_type
+      ),
+      issuer_entity_id: issuerEntityId,
+      issuer_name: (inv as { company_name?: string }).company_name || 'Issuer',
+      total_amount: (inv as { total_amount: string }).total_amount,
+      currency: String((inv as { currency?: string }).currency || 'USD'),
+    });
+    } catch (settleErr: any) {
+      const message = String(settleErr?.message || 'Settlement failed.');
+      if (
+        message.includes('Insufficient balance') ||
+        message.includes('not configured') ||
+        message.includes('Invalid settlement amount') ||
+        message.includes('negative')
+      ) {
+        return res.status(400).json({ error: message });
+      }
+      throw settleErr;
+    }
 
     const refId = (inv as { investment_request_id?: string; id: string }).investment_request_id || (inv as { id: string }).id;
     void sendPrivateExWebhook({
       investment_request_id: refId,
       ability_reference_id: refId,
       status: 'authorized',
+      fee_amount: settlement.fee_amount,
+      net_amount: settlement.net_amount,
       timestamp: new Date().toISOString(),
     });
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, settlement });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Authorization failed.' });
   }
@@ -1364,13 +2051,14 @@ app.post('/api/pending-investments/:id/authorize', requireAuth(), async (req, re
 async function declinePendingInvestmentHandler(req: express.Request, res: express.Response) {
   try {
     const { userId } = getAuth(req);
+    if (!(await assertWalletClass(userId, ['investor'], res))) return;
     const { pin } = req.body ?? {};
     if (!(await assertKycAndTransactionPin(userId, pin, res))) return;
     const { id } = req.params;
 
     const [inv] = await sql`
       UPDATE pending_investments
-      SET status = 'rejected'
+      SET status = 'rejected', settlement_status = 'failed'
       WHERE (id = ${id}::uuid OR ability_reference_id = ${id}::uuid OR investment_request_id = ${id}::uuid)
         AND user_id = ${userId}
         AND status IN ('PENDING', 'pending_authorization')
@@ -1747,7 +2435,7 @@ app.get('/api/admin/profiles', requireAuth(), async (req, res) => {
     }
 
     const rows = await sql`
-      SELECT up.user_id AS id, u.email, u.phone, up.full_name, up.country, up.national_id, up.created_at
+      SELECT up.user_id AS id, u.email, u.phone, up.full_name, up.wallet_class, up.country, up.national_id, up.created_at
       FROM user_profiles up
       JOIN users u ON u.id = up.user_id
       ORDER BY up.created_at DESC
@@ -1770,7 +2458,7 @@ app.patch('/api/admin/profiles/:targetUserId', requireAuth(), async (req, res) =
     const body = req.body ?? {};
 
     const [current] = await sql`
-      SELECT u.email, u.phone, up.full_name, up.country, up.national_id
+      SELECT u.email, u.phone, up.full_name, up.wallet_class, up.country, up.national_id
       FROM users u
       JOIN user_profiles up ON up.user_id = u.id
       WHERE u.id = ${targetUserId}::uuid
@@ -1785,6 +2473,7 @@ app.patch('/api/admin/profiles/:targetUserId', requireAuth(), async (req, res) =
       email: string | null;
       phone: string | null;
       full_name: string;
+      wallet_class: string;
       country: string | null;
       national_id: string | null;
     };
@@ -1792,6 +2481,7 @@ app.patch('/api/admin/profiles/:targetUserId', requireAuth(), async (req, res) =
     const nextEmail = body.email !== undefined ? body.email : c.email;
     const nextPhone = body.phone !== undefined ? body.phone : c.phone;
     const nextName = body.full_name !== undefined ? body.full_name : c.full_name;
+    const nextWalletClass = body.wallet_class !== undefined ? normalizeWalletClass(body.wallet_class, normalizeWalletClass(c.wallet_class, 'investor')) : normalizeWalletClass(c.wallet_class, 'investor');
     const nextCountry = body.country !== undefined ? body.country : c.country;
     const nextNational = body.national_id !== undefined ? body.national_id : c.national_id;
 
@@ -1804,11 +2494,20 @@ app.patch('/api/admin/profiles/:targetUserId', requireAuth(), async (req, res) =
       UPDATE user_profiles
       SET
         full_name = ${nextName},
+        wallet_class = ${nextWalletClass},
         country = ${nextCountry},
         national_id = ${nextNational},
         updated_at = NOW()
       WHERE user_id = ${targetUserId}::uuid
     `;
+    await sql`
+      UPDATE wallets
+      SET wallet_type = ${nextWalletClass}, updated_at = NOW()
+      WHERE user_id = ${targetUserId}::uuid
+    `;
+    if (body.wallet_class !== undefined) {
+      await upsertWalletClassArtifacts(targetUserId, nextWalletClass, body as Record<string, unknown>);
+    }
 
     return res.json({ ok: true });
   } catch (error: any) {

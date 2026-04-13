@@ -51,6 +51,11 @@ export default function IssuerDashboard() {
     (async () => {
       try {
         const [me, tx] = await Promise.all([getMe(token), getTransactions(token)]);
+        if (me.wallet_class !== 'issuer_company' && me.wallet_class !== 'issuer_government') {
+          setError('This account is not assigned to an Issuer Wallet.');
+          router.push('/');
+          return;
+        }
         setWalletBalance(me.wallet?.balance_usd || '0.00');
         setTransactions(mapTransactions(tx.transactions || []));
       } catch (err: any) {

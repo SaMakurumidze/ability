@@ -226,3 +226,74 @@ Used by Xchange flow to keep wallet movement consistent and safer than split cli
 - Schema migration helpers are included to rebuild legacy tables when old non-UUID user linkage is detected.
 - Theme defaults are persisted as light in DB and enforced in current Settings behavior.
 - Biometric toggle UI is currently removed from Settings (while biometric field remains in schema).
+
+## 8) Enforced wallet holder classes
+
+The Ability backend now enforces the wallet holder class model:
+
+- `investor` (mobile investor wallet)
+- `issuer_company` (company issuer wallet)
+- `issuer_government` (government issuer wallet)
+- `business_vendor` (vendor business wallet)
+- `business_contractor` (contractor business wallet)
+
+### Database enforcement
+
+- `user_profiles.wallet_class` is constrained to the allowed values.
+- `wallets.wallet_type` is constrained to the same allowed values and synchronized with `user_profiles.wallet_class`.
+- New class metadata tables:
+  - `issuer_wallet_profiles` (`issuer_kind`, `issuer_name`, `company_id`, `government_entity_id`)
+  - `business_wallet_profiles` (`business_type`, `business_name`, `linked_issuer_user_id`)
+
+### API enforcement
+
+- Public `POST /api/auth/register` only creates `investor` wallets.
+- Investor-only operations are guarded:
+  - `GET /api/pending-investments`
+  - `POST /api/pending-investments/:id/authorize`
+  - `POST /api/pending-investments/:id/decline` and `/cancel`
+  - `POST /api/investments/request` only accepts target users with `wallet_class = investor`
+- `GET /api/me` now returns:
+  - `wallet_class`
+  - `issuer_profile` (when wallet class is issuer)
+  - `business_profile` (when wallet class is business)
+
+### Admin provisioning
+
+- `POST /api/admin/wallet-holders/upsert`
+  - creates or updates a wallet holder and assigns class
+  - provisions related Neon records for issuer/business profile tables
+  - keeps `user_profiles.wallet_class` and `wallets.wallet_type` aligned
+
+## 9) Settlement engine (fintech-style)
+
+Operational wallets:
+
+- Investor Wallet (`user` / `user_wallet`)
+- Issuer Wallet (`company_wallet` or `government_wallet`)
+- Platform Escrow Wallet (`platform` / `investment_escrow_wallet`)
+- Platform Revenue Wallet (`platform` / `platform_revenue_wallet`)
+
+Engine behavior in `POST /api/pending-investments/:id/authorize`:
+
+1. Debit investor gross amount
+2. Credit escrow gross amount
+3. Debit escrow gross amount
+4. Credit issuer net amount
+5. Credit platform revenue fee
+
+Persisted artifacts:
+
+- `pending_investments` settlement fields:
+  - `issuer_entity_type`, `issuer_entity_id`
+  - `settlement_status`, `settlement_completed_at`
+  - `fee_amount`, `net_amount`
+- `investment_settlements` table:
+  - one record per `investment_request_id`
+  - gross/fee/net amounts, issuer target, processed timestamp, status
+
+Config knobs:
+
+- `PLATFORM_ESCROW_ENTITY_ID`
+- `PLATFORM_REVENUE_ENTITY_ID`
+- `SETTLEMENT_FEE_BPS`
